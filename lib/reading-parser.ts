@@ -357,6 +357,91 @@ function splitParagraphs(lines: string[], mode: TxtParagraphMode = "auto"): stri
 
 // ── EPUB Parsing ──
 
+/** 在 ZIP 中查找并读取文本文件：精确路径 → URL 解码 → 大小写不敏感兜底。
+ *  部分排版工具产出的 EPUB 里 OPF 的 href 与 ZIP 条目名在大小写/编码上不一致，
+ *  原来直接 zip.file(path) 查不到就静默丢章节，这里做兜底。 */
+async function readZipText(zip: any, path: string): Promise<string | null> {
+    const candidates = new Set<string>();
+    const push = (value: string) => { if (value) candidates.add(value); };
+    push(path);
+    try { push(decodeURIComponent(path)); } catch { /* 非法转义，保留原样 */ }
+
+    for (const candidate of candidates) {
+        const file = zip.file(candidate);
+        if (file) return (await file.async("text")) as string;
+    }
+
+    // 大小写不敏感兜底（ZIP 条目名与 OPF href 大小写不一致的书）
+    const lowerToReal = new Map<string, string>();
+    for (const key of Object.keys(zip.files || {})) {
+        const entry = zip.files[key];
+        if (!entry || entry.dir) continue;
+        const lower = key.toLowerCase();
+        if (!lowerToReal.has(lower)) lowerToReal.set(lower, key);
+    }
+    for (const candidate of candidates) {
+        const hit = lowerToReal.get(candidate.toLowerCase());
+        if (hit) {
+            const file = zip.file(hit);
+            if (file) return (await file.async("text")) as string;
+        }
+    }
+    return null;
+}
+
+/** 规整 ZIP 内路径：剥掉锚点/查询串，并按基准目录解析 ./ 与 ../。
+ *  原来只做 rootDir + href 拼接，遇到 "../Text/ch1.xhtml" 这类引用会取不到文件。 */
+function resolveZipPath(baseDir: string, href: string): string {
+    const cleaned = href.split("#")[0].split("?")[0];
+    let decoded = cleaned;
+    try { decoded = decodeURIComponent(cleaned); } catch { /* 保留原样 */ }
+
+    const raw = decoded.startsWith("/") ? decoded.slice(1) : baseDir + decoded;
+    const out: string[] = [];
+    for (const segment of raw.split("/")) {
+        if (!segment || segment === ".") continue;
+        if (segment === "..") { out.pop(); continue; }
+        out.push(segment);
+    }
+    return out.join("/");
+}
+
+/** 取标签属性值，单双引号都认 */
+function attrValue(tag: string, name: string): string {
+    const match = tag.match(new RegExp(`${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i"));
+    return (match?.[1] ?? match?.[2] ?? "").trim();
+}
+
+/** 解析 OPF manifest 的 id → href 映射：逐个 <item> 分别取属性，
+ *  不再依赖 id 与 href 的书写顺序或引号类型（原正则要求 id 在 href 前且双引号，
+ *  遇到 href 在前/单引号的 OPF 会整个映射为空，导致全书 0 章节）。 */
+function parseManifestItems(manifestXml: string): Map<string, string> {
+    const idToHref = new Map<string, string>();
+    const itemPattern = /<item\b[^>]*\/?>/gi;
+    let match: RegExpExecArray | null;
+    while ((match = itemPattern.exec(manifestXml)) !== null) {
+        const id = attrValue(match[0], "id");
+        const href = attrValue(match[0], "href");
+        if (id && href) idToHref.set(id, href);
+    }
+    if (idToHref.size === 0) {
+        // 畸形 XML（标签没闭合干净）兜底：两种属性顺序都试
+        const loosePatterns: Array<[RegExp, number, number]> = [
+            [/id\s*=\s*["']([^"']+)["'][^>]*?href\s*=\s*["']([^"']+)["']/gi, 1, 2],
+            [/href\s*=\s*["']([^"']+)["'][^>]*?id\s*=\s*["']([^"']+)["']/gi, 2, 1],
+        ];
+        for (const [pattern, idIndex, hrefIndex] of loosePatterns) {
+            let lm: RegExpExecArray | null;
+            while ((lm = pattern.exec(manifestXml)) !== null) {
+                const id = lm[idIndex];
+                const href = lm[hrefIndex];
+                if (id && href && !idToHref.has(id)) idToHref.set(id, href);
+            }
+        }
+    }
+    return idToHref;
+}
+
 /**
  * Parse EPUB file into chapters and paragraphs.
  * EPUB is a ZIP containing XHTML files.
@@ -365,53 +450,74 @@ export async function parseEpubFile(arrayBuffer: ArrayBuffer, fileName?: string)
     const JSZip = (await import("jszip")).default;
     const zip = await JSZip.loadAsync(arrayBuffer);
 
-    // 1. Find container.xml → rootfile path
-    const containerXml = await zip.file("META-INF/container.xml")?.async("text");
+    // 1. container.xml → rootfile 路径（可能有多个 rootfile，取第一个读得到的）
+    const containerXml = await readZipText(zip, "META-INF/container.xml");
     if (!containerXml) throw new Error("Invalid EPUB: missing container.xml");
-    const rootfileMatch = containerXml.match(/full-path="([^"]+)"/);
-    if (!rootfileMatch) throw new Error("Invalid EPUB: no rootfile");
-    const rootfilePath = rootfileMatch[1];
-    const rootDir = rootfilePath.includes("/") ? rootfilePath.substring(0, rootfilePath.lastIndexOf("/") + 1) : "";
+    const rootfilePaths: string[] = [];
+    const rootfilePattern = /<rootfile\b[^>]*\/?>/gi;
+    let rootfileMatch: RegExpExecArray | null;
+    while ((rootfileMatch = rootfilePattern.exec(containerXml)) !== null) {
+        const fullPath = attrValue(rootfileMatch[0], "full-path");
+        if (fullPath) rootfilePaths.push(fullPath);
+    }
+    if (rootfilePaths.length === 0) {
+        // 标签畸形时退回宽松扫描
+        const loose = containerXml.match(/full-path\s*=\s*["']([^"']+)["']/i);
+        if (loose) rootfilePaths.push(loose[1]);
+    }
+    if (rootfilePaths.length === 0) throw new Error("Invalid EPUB: no rootfile");
 
     // 2. Parse OPF (package document)
-    const opfXml = await zip.file(rootfilePath)?.async("text");
+    let opfXml: string | null = null;
+    let rootfilePath = rootfilePaths[0];
+    for (const candidate of rootfilePaths) {
+        const text = await readZipText(zip, resolveZipPath("", candidate));
+        if (text) { opfXml = text; rootfilePath = candidate; break; }
+    }
     if (!opfXml) throw new Error("Invalid EPUB: missing OPF");
+    const rootDir = rootfilePath.includes("/") ? rootfilePath.substring(0, rootfilePath.lastIndexOf("/") + 1) : "";
 
-    // Extract title and author
+    // Extract title and author（剥掉 CDATA 标记与残留标签）
+    const cleanMeta = (raw?: string) => {
+        const value = stripHtmlTags((raw || "").replace(/<!\[CDATA\[|\]\]>/g, "")).trim();
+        return value || undefined;
+    };
     const titleMatch = opfXml.match(/<dc:title[^>]*>([\s\S]*?)<\/dc:title>/i);
     const authorMatch = opfXml.match(/<dc:creator[^>]*>([\s\S]*?)<\/dc:creator>/i);
-    const bookTitle = titleMatch?.[1]?.trim() || fileName?.replace(/\.[^.]+$/, "") || "未命名";
-    const author = authorMatch?.[1]?.trim();
+    const bookTitle = cleanMeta(titleMatch?.[1]) || fileName?.replace(/\.[^.]+$/, "") || "未命名";
+    const author = cleanMeta(authorMatch?.[1]);
 
     // 3. Extract spine order (reading order)
     const spineItems: string[] = [];
     const spineMatch = opfXml.match(/<spine[^>]*>([\s\S]*?)<\/spine>/i);
     if (spineMatch) {
-        const itemRefPattern = /idref="([^"]+)"/g;
-        let m;
+        const itemRefPattern = /<itemref\b[^>]*\/?>/gi;
+        let m: RegExpExecArray | null;
         while ((m = itemRefPattern.exec(spineMatch[1])) !== null) {
-            spineItems.push(m[1]);
+            const idref = attrValue(m[0], "idref");
+            if (idref) spineItems.push(idref);
+        }
+        if (spineItems.length === 0) {
+            // 标签畸形（未闭合等）时退回属性扫描
+            const looseRefs = spineMatch[1].match(/idref\s*=\s*["']([^"']+)["']/gi) || [];
+            for (const ref of looseRefs) {
+                const value = ref.replace(/^idref\s*=\s*["']/i, "").replace(/["']$/, "");
+                if (value) spineItems.push(value);
+            }
         }
     }
 
     // 4. Build id → href map from manifest
-    const idToHref = new Map<string, string>();
-    const manifestMatch = opfXml.match(/<manifest[^>]*>([\s\S]*?)<\/manifest>/i);
-    if (manifestMatch) {
-        const itemPattern = /id="([^"]+)"[^>]*href="([^"]+)"/g;
-        let m;
-        while ((m = itemPattern.exec(manifestMatch[1])) !== null) {
-            idToHref.set(m[1], m[2]);
-        }
-    }
+    const idToHref = parseManifestItems(opfXml);
 
     // 5. Read each spine item and extract text
     const chapters: ParsedChapter[] = [];
     for (const itemId of spineItems) {
         const href = idToHref.get(itemId);
         if (!href) continue;
-        const filePath = rootDir + decodeURIComponent(href);
-        const html = await zip.file(filePath)?.async("text");
+        // 先按 OPF 所在目录解析；取不到再试「相对 ZIP 根」的扁路径（部分书 OPF 在子目录但引用不带前缀）
+        let html = await readZipText(zip, resolveZipPath(rootDir, href));
+        if (!html && rootDir) html = await readZipText(zip, resolveZipPath("", href));
         if (!html) continue;
 
         // Extract text from HTML
@@ -427,32 +533,126 @@ export async function parseEpubFile(arrayBuffer: ArrayBuffer, fileName?: string)
     return { title: bookTitle, author, chapters };
 }
 
-/** Extract readable text from HTML/XHTML content. */
-function extractTextFromHtml(html: string): { title: string; paragraphs: string[] } {
-    // Try to extract title from <title> or <h1>-<h3>
-    const titleMatch = html.match(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/i)
-        || html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-    const title = titleMatch ? stripHtmlTags(titleMatch[1]).trim() : "";
+const EPUB_BLOCK_TAGS = new Set([
+    "p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+    "blockquote", "td", "th", "dd", "dt", "section", "article", "figcaption", "pre",
+]);
 
-    // Extract text from <p>, <div>, <li> tags
+function normalizeInlineText(value: string | null | undefined): string {
+    return (value || "").replace(/\s+/g, " ").trim();
+}
+
+/** 元素自身的直接文本（不含子元素内的文本），用于嵌套块场景下不丢外层文字 */
+function directTextOf(element: Element): string {
+    return normalizeInlineText(
+        Array.from(element.childNodes)
+            .filter((node) => node.nodeType === 3)
+            .map((node) => node.textContent || "")
+            .join(" "),
+    );
+}
+
+/**
+ * 用 DOMParser 抽取正文：只取「内部不再含块级子元素」的叶子块。
+ * 既避免嵌套 <div> 被重复取文本，也不会像非贪婪正则那样在第一个 </div> 处提前收尾，
+ * 还能覆盖 <blockquote>/<td>/<h4>+ 等旧正则完全不看的标签。
+ * 返回 null 表示 DOM 路径不可用或没抽到内容，由调用方回退正则方案。
+ */
+function extractParagraphsFromDom(html: string): { title: string; paragraphs: string[] } | null {
+    if (typeof DOMParser === "undefined") return null;
+    let doc: Document;
+    try {
+        doc = new DOMParser().parseFromString(html, "text/html");
+    } catch {
+        return null;
+    }
+    const body = doc.body;
+    if (!body) return null;
+
+    // 样式/脚本里的文字不是正文
+    body.querySelectorAll("script, style, noscript").forEach((node) => node.remove());
+
     const paragraphs: string[] = [];
-    const blockPattern = /<(?:p|div|li)[^>]*>([\s\S]*?)<\/(?:p|div|li)>/gi;
-    let match;
-    while ((match = blockPattern.exec(html)) !== null) {
-        const text = stripHtmlTags(match[1]).trim();
-        if (text.length > 0) paragraphs.push(text);
+    const walk = (element: Element) => {
+        const own = directTextOf(element);
+        if (own) paragraphs.push(own);
+        for (const child of Array.from(element.children)) {
+            const tag = child.tagName.toLowerCase();
+            if (!EPUB_BLOCK_TAGS.has(tag)) {
+                walk(child);
+                continue;
+            }
+            const hasBlockChild = Array.from(child.children)
+                .some((inner) => EPUB_BLOCK_TAGS.has(inner.tagName.toLowerCase()));
+            if (hasBlockChild) {
+                walk(child);
+            } else {
+                const text = normalizeInlineText(child.textContent);
+                if (text) paragraphs.push(text);
+            }
+        }
+    };
+    walk(body);
+
+    // 完全没有块级标签的书：整段文本退回按换行切
+    if (paragraphs.length === 0) {
+        const plain = normalizeInlineText(body.textContent);
+        if (plain) paragraphs.push(...plain.split(/\n+/).map((line) => line.trim()).filter(Boolean));
     }
 
-    // Fallback: strip all tags and split by newlines
+    if (paragraphs.length === 0) return null;
+    return { title: findHeadingText(body), paragraphs };
+}
+
+function findHeadingText(root: Element): string {
+    for (const selector of ["h1", "h2", "h3"]) {
+        const text = normalizeInlineText(root.querySelector(selector)?.textContent);
+        if (text) return text;
+    }
+    return "";
+}
+
+/** Extract readable text from HTML/XHTML content. */
+function extractTextFromHtml(html: string): { title: string; paragraphs: string[] } {
+    const domResult = extractParagraphsFromDom(html);
+    const paragraphs = domResult?.paragraphs ?? [];
+    let title = domResult?.title || "";
+
+    // 正文标题兜底：<h1>-<h3> 或 <title>
+    if (!title) {
+        const titleMatch = html.match(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/i)
+            || html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+        title = titleMatch ? stripHtmlTags(titleMatch[1]).trim() : "";
+    }
+
+    // DOMParser 不可用（或 HTML 畸形到解析不出块级节点）时回退正则方案
+    if (paragraphs.length === 0) {
+        const blockPattern = /<(?:p|div|li|blockquote|td|h[1-6])[^>]*>([\s\S]*?)<\/(?:p|div|li|blockquote|td|h[1-6])>/gi;
+        let match: RegExpExecArray | null;
+        while ((match = blockPattern.exec(html)) !== null) {
+            const text = stripHtmlTags(match[1]).trim();
+            if (text.length > 0) paragraphs.push(text);
+        }
+    }
+
+    // 最后兜底：整页去标签后按空行切
     if (paragraphs.length === 0) {
         const plainText = stripHtmlTags(html).trim();
         if (plainText) {
-            const lines = plainText.split(/\n{2,}/).map(l => l.trim()).filter(l => l.length > 0);
-            paragraphs.push(...lines);
+            paragraphs.push(...plainText.split(/\n{2,}/).map(l => l.trim()).filter(l => l.length > 0));
         }
     }
 
     return { title, paragraphs };
+}
+
+function decodeCodePoint(code: number): string {
+    if (!Number.isFinite(code) || code < 0 || code > 0x10ffff) return "";
+    try {
+        return String.fromCodePoint(code);
+    } catch {
+        return "";
+    }
 }
 
 function stripHtmlTags(html: string): string {
@@ -462,9 +662,11 @@ function stripHtmlTags(html: string): string {
         .replace(/&nbsp;/g, " ")
         .replace(/&lt;/g, "<")
         .replace(/&gt;/g, ">")
-        .replace(/&amp;/g, "&")
         .replace(/&quot;/g, '"')
-        .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+        .replace(/&apos;/g, "'")
+        .replace(/&amp;/g, "&")
+        .replace(/&#x([0-9a-f]+);/gi, (_, code) => decodeCodePoint(parseInt(code, 16)))
+        .replace(/&#(\d+);/g, (_, code) => decodeCodePoint(Number(code)))
         .replace(/\s+/g, " ");
 }
 
